@@ -1,0 +1,24 @@
+{
+  "extraction_time": "2026-05-19 20:58:57",
+  "chemical_count": 10248,
+  "chembert_dim": 768,
+  "morgan_dim": 2048,
+  "chemical_feat_dim": 2816,
+  "protein_count": 21267,
+  "protein_feat_dim": 1280,
+  "disease_count": 345,
+  "disease_feat_dim": 768,
+  "gene_count": 29906,
+  "go_vocab_size": 14945,
+  "gene_feat_dim": 14945,
+  "pathogen_count": 926,
+  "taxo_vocab_size": 929,
+  "pathogen_feat_dim": 929,
+  "feature_dims": {
+    "chemical": 2816,
+    "protein": 1280,
+    "disease": 768,
+    "gene": 14945,
+    "pathogen": 929
+  }
+}
