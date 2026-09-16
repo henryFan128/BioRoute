@@ -2,7 +2,6 @@
 
 BioRoute is a biomedical heterogeneous-graph learning framework for drug-disease treatment prediction. The current release focuses on the supervised relation:
 
-
 ## Pretrained Feature Models
 
 Download pretrained models manually from Hugging Face. Suggested local placement:
@@ -11,11 +10,11 @@ Download pretrained models manually from Hugging Face. Suggested local placement
 data/pretrained/
 ```
 
-| Feature type | Model | URL |
-| --- | --- | --- |
-| Protein sequence | ESM-2 `facebook/esm2_t33_650M_UR50D` | https://huggingface.co/facebook/esm2_t33_650M_UR50D |
-| Disease text | BioClinicalBERT `emilyalsentzer/Bio_ClinicalBERT` | https://huggingface.co/emilyalsentzer/Bio_ClinicalBERT |
-| Chemical SMILES | ChemBERTa `seyonec/ChemBERTa-zinc-base-v1` | https://huggingface.co/seyonec/ChemBERTa-zinc-base-v1 |
+| Feature type     | Model                                            | URL                                                    |
+| ---------------- | ------------------------------------------------ | ------------------------------------------------------ |
+| Protein sequence | ESM-2`facebook/esm2_t33_650M_UR50D`              | https://huggingface.co/facebook/esm2_t33_650M_UR50D    |
+| Disease text     | BioClinicalBERT`emilyalsentzer/Bio_ClinicalBERT` | https://huggingface.co/emilyalsentzer/Bio_ClinicalBERT |
+| Chemical SMILES  | ChemBERTa`seyonec/ChemBERTa-zinc-base-v1`        | https://huggingface.co/seyonec/ChemBERTa-zinc-base-v1  |
 
 ## Installation
 
@@ -24,14 +23,6 @@ The provided `requirements.txt` is an environment export from the development en
 ```bash
 conda create --name bioroute --file requirements.txt
 conda activate bioroute
-```
-
-## Training
-
-Default command:
-
-```bash
-python script/train.py --config config/train.yaml
 ```
 
 ## Repository Layout
