@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional
 
 import torch
-import torch.nn as nn
+from torch import nn
 from torch_geometric.utils import softmax
 
 from .relation_encoder import RelationEncoderState, RelationTriple
@@ -15,10 +15,11 @@ from .relation_encoder import RelationEncoderState, RelationTriple
 class SRRBlockOutput:
     """Outputs of one dual-stream masked message-passing layer."""
 
-    x_dict: Dict[str, torch.Tensor]
-    intra_messages: Dict[str, torch.Tensor]
-    inter_messages: Dict[str, torch.Tensor]
+    x_dict: dict[str, torch.Tensor]
+    intra_messages: dict[str, torch.Tensor]
+    inter_messages: dict[str, torch.Tensor]
     relation_state: RelationEncoderState
+    explain: dict[str, dict[RelationTriple, dict[str, torch.Tensor]]] | None = None
 
 
 class SRRLayer(nn.Module):
@@ -81,7 +82,6 @@ class SRRLayer(nn.Module):
             nn.Linear(hidden_channels, hidden_channels),
         )
 
-        # Relation / edge evolution: E_r^(l) = E_r^(l-1) + MLP(mean(h_src || h_dst)).
         self.relation_summary_proj = nn.Sequential(
             nn.Linear(hidden_channels * 2, hidden_channels),
             nn.GELU(),
@@ -104,7 +104,7 @@ class SRRLayer(nn.Module):
     def _split_heads(self, x: torch.Tensor) -> torch.Tensor:
         return x.reshape(x.shape[0], self.num_heads, self.head_dim)
 
-    def _init_message_buffers(self, x_dict: Mapping[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+    def _init_message_buffers(self, x_dict: Mapping[str, torch.Tensor]) -> dict[str, torch.Tensor]:
         return {
         node_type: x.new_zeros(x.shape[0], self.hidden_channels)
         for node_type, x in x_dict.items()
@@ -114,7 +114,7 @@ class SRRLayer(nn.Module):
         self,
         x_dict: Mapping[str, torch.Tensor],
         edge_index_dict: Mapping[RelationTriple, torch.Tensor],
-        relation_state: Optional[RelationEncoderState],
+        relation_state: RelationEncoderState | None,
     ) -> RelationEncoderState:
         ref_tensor = next(iter(x_dict.values()))
         relation_keys: set[RelationTriple] = set(edge_index_dict.keys())
@@ -123,9 +123,9 @@ class SRRLayer(nn.Module):
             relation_keys.update(relation_state.evolved.keys())
             relation_keys.update(relation_state.pair_summary.keys())
 
-        base: Dict[RelationTriple, torch.Tensor] = {}
-        evolved: Dict[RelationTriple, torch.Tensor] = {}
-        pair_summary: Dict[RelationTriple, torch.Tensor] = {}
+        base: dict[RelationTriple, torch.Tensor] = {}
+        evolved: dict[RelationTriple, torch.Tensor] = {}
+        pair_summary: dict[RelationTriple, torch.Tensor] = {}
         for triple in relation_keys:
             zero = ref_tensor.new_zeros(self.hidden_channels)
             if relation_state is None:
@@ -165,8 +165,10 @@ class SRRLayer(nn.Module):
         edge_index_dict: Mapping[RelationTriple, torch.Tensor],
         relation_state: RelationEncoderState,
         intra_only: bool,
-    ) -> Dict[str, torch.Tensor]:
+        return_explain: bool = False,
+    ) -> tuple[dict[str, torch.Tensor], dict[RelationTriple, dict[str, torch.Tensor]]]:
         messages = self._init_message_buffers(x_dict)
+        explain: dict[RelationTriple, dict[str, torch.Tensor]] = {}
 
         for triple, edge_index in edge_index_dict.items():
             src_type, _, dst_type = triple
@@ -194,7 +196,7 @@ class SRRLayer(nn.Module):
                 rel_vec = self._relation_vector(triple, relation_state, src_feat)
                 rel_feat = self.inter_rel_proj(rel_vec).unsqueeze(0).expand(src_feat.shape[0], -1)
                 q = self._split_heads(self.inter_q_proj(dst_feat))
-                k = self._split_heads(self.inter_k_proj(src_feat + rel_feat))
+                k = self._split_heads(self.inter_k_proj(src_feat * rel_feat))
                 v = self._split_heads(self.inter_v_proj(src_feat))
 
             scores = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)
@@ -202,12 +204,19 @@ class SRRLayer(nn.Module):
             alpha = self.attn_dropout(alpha)
             msg = (alpha.unsqueeze(-1) * v).reshape(src_feat.shape[0], self.hidden_channels)
             messages[dst_type] = messages[dst_type].index_add(0, dst_idx, msg)
+            if return_explain:
+                explain[triple] = {
+                    "edge_index": edge_index.detach().clone(),
+                    "score": scores.detach().clone(),
+                    "alpha": alpha.detach().clone(),
+                }
 
         out_proj = self.intra_out_proj if intra_only else self.inter_out_proj
-        return {
+        projected = {
             node_type: out_proj(messages[node_type])
             for node_type in messages
         }
+        return projected, explain
 
     def _residual_update(
         self,
@@ -215,8 +224,8 @@ class SRRLayer(nn.Module):
         messages: Mapping[str, torch.Tensor],
         updater: nn.Module,
         norm: nn.Module,
-    ) -> Dict[str, torch.Tensor]:
-        out: Dict[str, torch.Tensor] = {}
+    ) -> dict[str, torch.Tensor]:
+        out: dict[str, torch.Tensor] = {}
         for node_type, x in x_dict.items():
             delta = updater(torch.cat([x, messages[node_type]], dim=-1))
             out[node_type] = norm(x + self.dropout(delta))
@@ -234,8 +243,8 @@ class SRRLayer(nn.Module):
         relation_keys.update(relation_state.evolved.keys())
 
         base = dict(relation_state.base)
-        evolved: Dict[RelationTriple, torch.Tensor] = {}
-        pair_summary: Dict[RelationTriple, torch.Tensor] = {}
+        evolved: dict[RelationTriple, torch.Tensor] = {}
+        pair_summary: dict[RelationTriple, torch.Tensor] = {}
 
         for triple in relation_keys:
             prev_rel = relation_state.evolved.get(
@@ -276,7 +285,8 @@ class SRRLayer(nn.Module):
         self,
         x_dict: Mapping[str, torch.Tensor],
         edge_index_dict: Mapping[RelationTriple, torch.Tensor],
-        relation_state: Optional[RelationEncoderState] = None,
+        relation_state: RelationEncoderState | None = None,
+        return_explain: bool = False,
     ) -> SRRBlockOutput:
         seed_relation_state = self._prepare_relation_state(
             x_dict=x_dict,
@@ -284,11 +294,12 @@ class SRRLayer(nn.Module):
             relation_state=relation_state,
         )
 
-        intra_messages = self._aggregate_messages(
+        intra_messages, intra_explain = self._aggregate_messages(
             x_dict=x_dict,
             edge_index_dict=edge_index_dict,
             relation_state=seed_relation_state,
             intra_only=True,
+            return_explain=return_explain,
         )
         intra_out = self._residual_update(
             x_dict=x_dict,
@@ -297,11 +308,12 @@ class SRRLayer(nn.Module):
             norm=self.intra_norm,
         )
 
-        inter_messages = self._aggregate_messages(
+        inter_messages, inter_explain = self._aggregate_messages(
             x_dict=intra_out,
             edge_index_dict=edge_index_dict,
             relation_state=seed_relation_state,
             intra_only=False,
+            return_explain=return_explain,
         )
         inter_out = self._residual_update(
             x_dict=intra_out,
@@ -319,9 +331,17 @@ class SRRLayer(nn.Module):
             relation_state=seed_relation_state,
         )
 
+        explain: dict[str, dict[RelationTriple, dict[str, torch.Tensor]]] | None = None
+        if return_explain:
+            explain = {
+                "intra_attention": intra_explain,
+                "inter_attention": inter_explain,
+            }
+
         return SRRBlockOutput(
             x_dict=inter_out,
             intra_messages=intra_messages,
             inter_messages=inter_messages,
             relation_state=evolved_relation_state,
+            explain=explain,
         )

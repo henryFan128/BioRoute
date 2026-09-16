@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,6 +18,7 @@ class GlobalRouterOutput:
 
     node_context: Dict[str, torch.Tensor]
     router_state: Dict[str, torch.Tensor]
+    explain: Dict[str, Dict[str, Any]] | None = None
 
 
 class GlobalRouter(nn.Module):
@@ -44,12 +45,19 @@ class GlobalRouter(nn.Module):
         x_dict: Mapping[str, torch.Tensor],
         edge_index_dict: Mapping[RelationTriple, torch.Tensor],
         relation_state: RelationEncoderState | None = None,
+        return_explain: bool = False,
     ) -> GlobalRouterOutput:
-        node_context, router_state = self.router(
+        router_result = self.router(
             x_dict=dict(x_dict),
             edge_index_dict=dict(edge_index_dict),
             relation_state=relation_state,
+            return_explain=return_explain,
         )
+        if return_explain:
+            node_context, router_state, explain = router_result
+        else:
+            node_context, router_state = router_result
+            explain = None
         if relation_state is not None:
             router_state = dict(router_state)
             router_state["num_relations"] = torch.tensor(
@@ -59,4 +67,5 @@ class GlobalRouter(nn.Module):
         return GlobalRouterOutput(
             node_context=node_context,
             router_state=router_state,
+            explain=explain,
         )

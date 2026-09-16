@@ -150,28 +150,34 @@ class KGCModel(nn.Module):
         self,
         x_dict: Dict[str, torch.Tensor],
         edge_index_dict: Dict[RelationTriple, torch.Tensor],
-    ) -> Tuple[Dict[str, torch.Tensor], RelationEncoderState]:
+        return_explain: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], RelationEncoderState, list[dict[str, object]]]:
         device = next(iter(x_dict.values())).device
         relation_state = self.relation_encoder.init_state(device=device)
         srr_input = dict(x_dict)
+        srr_explain: list[dict[str, object]] = []
         for layer in self.srr_layers:
             block_out = layer(
                 srr_input,
                 edge_index_dict,
                 relation_state=relation_state,
+                return_explain=return_explain,
             )
             srr_input = {
                 node_type: self.dropout_layer(feat)
                 for node_type, feat in block_out.x_dict.items()
             }
             relation_state = block_out.relation_state
-        return srr_input, relation_state
+            if return_explain and block_out.explain is not None:
+                srr_explain.append(block_out.explain)
+        return srr_input, relation_state, srr_explain
 
     def _run_router(
         self,
         x_dict: Dict[str, torch.Tensor],
         edge_index_dict: Dict[RelationTriple, torch.Tensor],
         relation_state: RelationEncoderState,
+        return_explain: bool = False,
     ) -> Tuple[Optional[Dict[str, torch.Tensor]], Optional[GlobalRouterOutput]]:
         if not self.use_global_router or self.global_router is None:
             return None, None
@@ -179,6 +185,7 @@ class KGCModel(nn.Module):
             x_dict,
             edge_index_dict,
             relation_state=relation_state,
+            return_explain=return_explain,
         )
         return router_output.node_context, router_output
 
@@ -244,14 +251,16 @@ class KGCModel(nn.Module):
         return_attention_weights: bool = False,
     ):
         semantic_features = self._semantic_init(x_dict)
-        srr_features, relation_state = self._run_srr_backbone(
+        srr_features, relation_state, srr_explain = self._run_srr_backbone(
             semantic_features,
             edge_index_dict,
+            return_explain=return_attention_weights,
         )
         routed_features, router_output = self._run_router(
             semantic_features,
             edge_index_dict,
             relation_state,
+            return_explain=return_attention_weights,
         )
 
         semantic_proj = self._project_branch(
@@ -287,9 +296,11 @@ class KGCModel(nn.Module):
                 "semantic_proj": semantic_proj,
                 "SRR_proj": srr_proj,
                 "gate_weights": gate_weights,
+                "srr_explain": srr_explain,
             }
             if router_output is not None:
                 aux["router_output"] = router_output
+                aux["router_explain"] = router_output.explain
             if router_proj is not None:
                 aux["router_proj"] = router_proj
             return final_x_dict, aux
@@ -302,14 +313,16 @@ class KGCModel(nn.Module):
         return_attention_weights: bool = True,
     ):
         semantic_features = self._semantic_init(x_dict)
-        srr_features, relation_state = self._run_srr_backbone(
+        srr_features, relation_state, srr_explain = self._run_srr_backbone(
             semantic_features,
             edge_index_dict,
+            return_explain=return_attention_weights,
         )
         routed_features, router_output = self._run_router(
             semantic_features,
             edge_index_dict,
             relation_state,
+            return_explain=return_attention_weights,
         )
         semantic_proj = self._project_branch(
             semantic_features,
@@ -341,12 +354,16 @@ class KGCModel(nn.Module):
             "gate_weights": gate_weights,
             "final": final_x_dict,
             "relation_state": relation_state,
+            "srr_explain": srr_explain,
         }
         if router_output is not None:
             result["router_output"] = router_output
+            result["router_explain"] = router_output.explain
         if return_attention_weights and router_output is not None:
             result["attention"] = {
                 "router_state": router_output.router_state,
+                "router_explain": router_output.explain,
+                "srr_explain": srr_explain,
             }
         return result
 

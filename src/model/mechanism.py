@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -226,11 +226,13 @@ class MechanismRouter(nn.Module):
         x_dict: Mapping[str, torch.Tensor],
         subgraph_edges: Mapping[RelationTriple, torch.Tensor],
         relation_state: Optional[RelationEncoderState],
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int]:
+        return_explain: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], int, Dict[RelationTriple, Dict[str, torch.Tensor]]]:
         local_messages = self._empty_feature_buffers(x_dict)
         node_counts = self._empty_count_buffers(x_dict)
         active_masks = self._empty_mask_buffers(x_dict)
         total_edges = 0
+        edge_explain: Dict[RelationTriple, Dict[str, torch.Tensor]] = {}
 
         for triple, edge_index in subgraph_edges.items():
             src_type, _, dst_type = triple
@@ -259,6 +261,11 @@ class MechanismRouter(nn.Module):
             )
             edge_hidden = self.edge_mlps[mechanism.name](edge_input)
             edge_gate = torch.sigmoid(self.edge_gate_mlps[mechanism.name](edge_hidden))
+            if return_explain:
+                edge_explain[triple] = {
+                    "edge_index": edge_index.detach().clone(),
+                    "gate": edge_gate.detach().clone(),
+                }
 
             src_msg = self.edge_to_src[mechanism.name](edge_hidden) * edge_gate
             dst_msg = self.edge_to_dst[mechanism.name](edge_hidden) * edge_gate
@@ -279,7 +286,7 @@ class MechanismRouter(nn.Module):
             normed = local_messages[node_type] / node_counts[node_type].clamp_min(1.0)
             local_summary[node_type] = self.local_norms[mechanism.name](normed)
 
-        return local_summary, active_masks, total_edges
+        return local_summary, active_masks, total_edges, edge_explain
 
     def _pool_virtual_node(
         self,
@@ -287,12 +294,14 @@ class MechanismRouter(nn.Module):
         x_dict: Mapping[str, torch.Tensor],
         local_summary: Mapping[str, torch.Tensor],
         active_masks: Mapping[str, torch.Tensor],
-    ) -> Tuple[torch.Tensor, int]:
+        return_explain: bool = False,
+    ) -> Tuple[torch.Tensor, int, Dict[str, Dict[str, torch.Tensor]]]:
         token_seed = self.token_embeddings[mechanism.name]
 
         weighted_sum: Optional[torch.Tensor] = None
         weight_sum: Optional[torch.Tensor] = None
         active_nodes = 0
+        readout_explain: Dict[str, Dict[str, torch.Tensor]] = {}
 
         for node_type in mechanism.node_types:
             if node_type not in x_dict:
@@ -311,6 +320,11 @@ class MechanismRouter(nn.Module):
             )
             token_contrib = self.node_to_token[mechanism.name](node_input)
             contrib_gate = torch.sigmoid(self.readout_gate[mechanism.name](node_input))
+            if return_explain:
+                readout_explain[node_type] = {
+                    "node_indices": mask.nonzero(as_tuple=False).flatten().detach().clone(),
+                    "gate": contrib_gate.detach().clone(),
+                }
 
             contrib_sum = (token_contrib * contrib_gate).sum(dim=0)
             gate_sum = contrib_gate.sum(dim=0)
@@ -323,7 +337,7 @@ class MechanismRouter(nn.Module):
                 weight_sum = weight_sum + gate_sum
 
         if weighted_sum is None or weight_sum is None:
-            return self.token_norms[mechanism.name](token_seed), active_nodes
+            return self.token_norms[mechanism.name](token_seed), active_nodes, readout_explain
 
         pooled = weighted_sum / weight_sum.clamp_min(1e-6)
         token_delta = self.token_update[mechanism.name](
@@ -332,7 +346,7 @@ class MechanismRouter(nn.Module):
         token = self.token_norms[mechanism.name](
             token_seed + self.dropout(token_delta)
         )
-        return token, active_nodes
+        return token, active_nodes, readout_explain
 
     def _write_back(
         self,
@@ -341,8 +355,10 @@ class MechanismRouter(nn.Module):
         local_summary: Mapping[str, torch.Tensor],
         active_masks: Mapping[str, torch.Tensor],
         mechanism_token: torch.Tensor,
-    ) -> Dict[str, torch.Tensor]:
+        return_explain: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Dict[str, torch.Tensor]]]:
         node_delta = self._empty_feature_buffers(x_dict)
+        writeback_explain: Dict[str, Dict[str, torch.Tensor]] = {}
 
         for node_type in mechanism.node_types:
             if node_type not in x_dict:
@@ -361,42 +377,52 @@ class MechanismRouter(nn.Module):
             delta = self.token_to_node[mechanism.name](write_input)
             gate = torch.sigmoid(self.node_gate[mechanism.name](write_input))
             node_delta[node_type][mask] = delta * gate
+            if return_explain:
+                writeback_explain[node_type] = {
+                    "node_indices": mask.nonzero(as_tuple=False).flatten().detach().clone(),
+                    "gate": gate.detach().clone(),
+                }
 
-        return node_delta
+        return node_delta, writeback_explain
 
     def forward(
         self,
         x_dict: Mapping[str, torch.Tensor],
         edge_index_dict: Mapping[RelationTriple, torch.Tensor],
         relation_state: Optional[RelationEncoderState] = None,
-    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        return_explain: bool = False,
+    ) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]] | Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor], Dict[str, Dict[str, Any]]]:
         combined_delta = self._empty_feature_buffers(x_dict)
         mechanism_hits = self._empty_count_buffers(x_dict)
         router_state: Dict[str, torch.Tensor] = {}
+        explain: Dict[str, Dict[str, Any]] = {}
 
         for mechanism in self.mechanism_specs:
             subgraph_edges = self._induce_subgraph_edges(
                 mechanism=mechanism,
                 edge_index_dict=edge_index_dict,
             )
-            local_summary, active_masks, active_edges = self._edge_localize(
+            local_summary, active_masks, active_edges, edge_explain = self._edge_localize(
                 mechanism=mechanism,
                 x_dict=x_dict,
                 subgraph_edges=subgraph_edges,
                 relation_state=relation_state,
+                return_explain=return_explain,
             )
-            mechanism_token, active_nodes = self._pool_virtual_node(
+            mechanism_token, active_nodes, readout_explain = self._pool_virtual_node(
                 mechanism=mechanism,
                 x_dict=x_dict,
                 local_summary=local_summary,
                 active_masks=active_masks,
+                return_explain=return_explain,
             )
-            mechanism_delta = self._write_back(
+            mechanism_delta, writeback_explain = self._write_back(
                 mechanism=mechanism,
                 x_dict=x_dict,
                 local_summary=local_summary,
                 active_masks=active_masks,
                 mechanism_token=mechanism_token,
+                return_explain=return_explain,
             )
 
             for node_type in combined_delta:
@@ -415,6 +441,19 @@ class MechanismRouter(nn.Module):
             router_state[
                 f"{mechanism.name}_active_relations"
             ] = mechanism_token.new_tensor(float(len(subgraph_edges)))
+            if return_explain:
+                explain[mechanism.name] = {
+                    "active_edges": active_edges,
+                    "active_nodes": active_nodes,
+                    "active_relations": len(subgraph_edges),
+                    "edge_gates": edge_explain,
+                    "readout_gates": readout_explain,
+                    "writeback_gates": writeback_explain,
+                    "active_masks": {
+                        node_type: mask.detach().clone()
+                        for node_type, mask in active_masks.items()
+                    },
+                }
 
         node_context: Dict[str, torch.Tensor] = {}
         for node_type, x in x_dict.items():
@@ -431,4 +470,6 @@ class MechanismRouter(nn.Module):
             updated[hit_mask] = updated_active
             node_context[node_type] = updated
 
+        if return_explain:
+            return node_context, router_state, explain
         return node_context, router_state
