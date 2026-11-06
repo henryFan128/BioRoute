@@ -10,7 +10,6 @@ import torch
 import torch.optim as optim
 from sklearn.metrics import average_precision_score, roc_auc_score
 from torch.nn.parallel import DistributedDataParallel as DDP
-from tqdm import tqdm
 
 from .utils.distributed import (
     DistributedState,
@@ -23,6 +22,7 @@ from .utils.evaluation import monitor_gradients
 from .utils.ranking import (
     collect_positive_pairs,
     full_candidate_filtered_ranking_metrics,
+    full_candidate_ranking_diagnostics,
     ranking_group_axis_to_int,
     sampled_grouped_ranking_metrics,
 )
@@ -63,6 +63,7 @@ class TrainerConfig:
     mechanism_dropout: float = 0.1
     train_neg_per_pos: int = 5
     online_negative_sampling: bool = True
+    online_negative_with_replacement: bool = True
     use_contraindication_negatives: bool = True
     contraindication_relation: tuple[str, str, str] = (
         "chemical",
@@ -72,6 +73,7 @@ class TrainerConfig:
     negative_curriculum_epochs: int = 0
     negative_start_factor: float = 1.0
     hard_negative_ratio_start: float = 0.0
+    hard_negative_ratio_target: Optional[float] = None
     min_learning_rate_ratio: float = 0.1
     aux_focal_enabled: bool = False
     aux_focal_alpha: float = 0.25
@@ -299,6 +301,7 @@ class Trainer:
         edge_label_index: torch.Tensor,
         edge_label: torch.Tensor,
         filtered_positive_pairs: Optional[set[tuple[int, int]]] = None,
+        message_passing_edges: Optional[Dict[Tuple[str, str, str], torch.Tensor]] = None,
     ) -> Dict[str, float]:
         src_type, _, dst_type = self.cfg.edge_type_to_predict
         num_src_nodes = int(data[src_type].num_nodes)
@@ -314,7 +317,13 @@ class Trainer:
             )
             return torch.sigmoid(logits).detach().float().cpu().numpy()
 
-        return full_candidate_filtered_ranking_metrics(
+        candidate_ids = getattr(data, "ranking_candidate_ids", None)
+        if candidate_ids is None:
+            candidate_ids = getattr(data, "negative_allowed_dst", None)
+        if ranking_group_axis_to_int(self.cfg.ranking_group_axis) != 0:
+            candidate_ids = None
+
+        metrics = full_candidate_filtered_ranking_metrics(
             edge_label_index=edge_label_index,
             edge_label=edge_label,
             num_src_nodes=num_src_nodes,
@@ -323,7 +332,165 @@ class Trainer:
             known_positive_pairs=filtered_positive_pairs,
             group_axis=self.cfg.ranking_group_axis,
             candidate_batch_size=int(self.cfg.full_ranking_candidate_batch_size),
+            candidate_ids=candidate_ids,
         )
+        if candidate_ids is not None:
+            all_metrics = full_candidate_filtered_ranking_metrics(
+                edge_label_index=edge_label_index,
+                edge_label=edge_label,
+                num_src_nodes=num_src_nodes,
+                num_dst_nodes=num_dst_nodes,
+                score_edges_fn=score_edges,
+                known_positive_pairs=filtered_positive_pairs,
+                group_axis=self.cfg.ranking_group_axis,
+                candidate_batch_size=int(self.cfg.full_ranking_candidate_batch_size),
+            )
+            metrics.update(
+                {
+                    f"AllCandidate{metric_name}": metric_value
+                    for metric_name, metric_value in all_metrics.items()
+                }
+            )
+            metrics["RankingCandidateCount"] = float(
+                candidate_ids.numel()
+                if torch.is_tensor(candidate_ids)
+                else len(candidate_ids)
+            )
+            metrics["AllCandidateCount"] = float(
+                num_dst_nodes if ranking_group_axis_to_int(self.cfg.ranking_group_axis) == 0 else num_src_nodes
+            )
+
+            diagnostics = full_candidate_ranking_diagnostics(
+                edge_label_index=edge_label_index,
+                edge_label=edge_label,
+                num_src_nodes=num_src_nodes,
+                num_dst_nodes=num_dst_nodes,
+                score_edges_fn=score_edges,
+                known_positive_pairs=filtered_positive_pairs,
+                group_axis=self.cfg.ranking_group_axis,
+                candidate_batch_size=int(self.cfg.full_ranking_candidate_batch_size),
+                candidate_ids=candidate_ids,
+                top_k=10,
+            )
+            metrics["CandidateTop10Concentration"] = float(
+                diagnostics["top_k_slot_concentration"]
+            )
+            metrics["CandidateTop10Unique"] = float(
+                diagnostics["top_k_unique_candidates"]
+            )
+            metrics["CandidateTop1Unique"] = float(
+                diagnostics["top1_unique_candidates"]
+            )
+            per_candidate = diagnostics["per_candidate"]
+            popular_candidates = sorted(
+                per_candidate.items(),
+                key=lambda item: (-float(item[1]["topk_count"]), int(item[0])),
+            )
+            for rank, (candidate, payload) in enumerate(popular_candidates[:3], start=1):
+                metrics[f"CandidateTop{rank}Id"] = float(candidate)
+                metrics[f"CandidateTop{rank}MeanRank"] = float(payload["mean_rank"])
+            if len(per_candidate) <= 128:
+                for candidate, payload in sorted(
+                    per_candidate.items(), key=lambda item: int(item[0])
+                ):
+                    metrics[f"Candidate{int(candidate)}MeanRank"] = float(
+                        payload["mean_rank"]
+                    )
+                    metrics[f"Candidate{int(candidate)}Top10Rate"] = float(
+                        payload["topk_count"]
+                        / max(float(diagnostics["group_count"]), 1.0)
+                    )
+
+            if message_passing_edges is not None:
+                background_scores = self._background_candidate_scores(
+                    edge_index_dict=message_passing_edges,
+                    num_src_nodes=num_src_nodes,
+                    num_dst_nodes=num_dst_nodes,
+                    candidate_ids=candidate_ids,
+                )
+                background_metrics = full_candidate_filtered_ranking_metrics(
+                    edge_label_index=edge_label_index,
+                    edge_label=edge_label,
+                    num_src_nodes=num_src_nodes,
+                    num_dst_nodes=num_dst_nodes,
+                    score_edges_fn=background_scores,
+                    known_positive_pairs=filtered_positive_pairs,
+                    group_axis=self.cfg.ranking_group_axis,
+                    candidate_batch_size=int(self.cfg.full_ranking_candidate_batch_size),
+                    candidate_ids=candidate_ids,
+                )
+                metrics.update(
+                    {
+                        f"BackgroundDegree{metric_name}": metric_value
+                        for metric_name, metric_value in background_metrics.items()
+                    }
+                )
+
+                random_metrics = full_candidate_filtered_ranking_metrics(
+                    edge_label_index=edge_label_index,
+                    edge_label=edge_label,
+                    num_src_nodes=num_src_nodes,
+                    num_dst_nodes=num_dst_nodes,
+                    score_edges_fn=self._random_candidate_scores,
+                    known_positive_pairs=filtered_positive_pairs,
+                    group_axis=self.cfg.ranking_group_axis,
+                    candidate_batch_size=int(self.cfg.full_ranking_candidate_batch_size),
+                    candidate_ids=candidate_ids,
+                )
+                metrics.update(
+                    {
+                        f"Random{metric_name}": metric_value
+                        for metric_name, metric_value in random_metrics.items()
+                    }
+                )
+        return metrics
+
+    def _background_candidate_scores(
+        self,
+        edge_index_dict: Dict[Tuple[str, str, str], torch.Tensor],
+        num_src_nodes: int,
+        num_dst_nodes: int,
+        candidate_ids,
+    ):
+        axis = ranking_group_axis_to_int(self.cfg.ranking_group_axis)
+        src_type, relation, dst_type = self.cfg.edge_type_to_predict
+        candidate_count = num_dst_nodes if axis == 0 else num_src_nodes
+        degree = np.zeros(candidate_count, dtype=np.float64)
+        for edge_type, edge_index in edge_index_dict.items():
+            if edge_type == self.cfg.edge_type_to_predict:
+                continue
+            if {edge_type[0], edge_type[2]} == {src_type, dst_type} and "treat" in edge_type[1].lower():
+                continue
+            edge_index_cpu = edge_index.detach().cpu()
+            if axis == 0 and edge_type[2] == dst_type:
+                ids = edge_index_cpu[1].numpy()
+            elif axis == 0 and edge_type[0] == dst_type:
+                ids = edge_index_cpu[0].numpy()
+            elif axis == 1 and edge_type[0] == src_type:
+                ids = edge_index_cpu[0].numpy()
+            elif axis == 1 and edge_type[2] == src_type:
+                ids = edge_index_cpu[1].numpy()
+            else:
+                continue
+            degree += np.bincount(ids, minlength=candidate_count)[:candidate_count]
+
+        def score_edges(edge_index: torch.Tensor) -> np.ndarray:
+            candidate_index = edge_index[1 if axis == 0 else 0].detach().cpu().numpy()
+            return degree[candidate_index]
+
+        return score_edges
+
+    @staticmethod
+    def _random_candidate_scores(edge_index: torch.Tensor) -> np.ndarray:
+        values = []
+        axis_candidates = edge_index[1].detach().cpu().tolist()
+        groups = edge_index[0].detach().cpu().tolist()
+        for group_id, candidate_id in zip(groups, axis_candidates):
+            value = np.sin(
+                float((int(group_id) + 1) * 1000003 + (int(candidate_id) + 1) * 9176)
+            )
+            values.append(float(value))
+        return np.asarray(values, dtype=np.float64)
 
     def _init_model_and_optimizer(self, train_data):
         from .model.model import KGCModel
@@ -533,7 +700,10 @@ class Trainer:
 
     def _effective_hard_negative_ratio(self, epoch: int) -> float:
         target = 0.0
-        if self.neg_sampler is not None and hasattr(self.neg_sampler, "hard_neg_ratio"):
+        configured_target = getattr(self.cfg, "hard_negative_ratio_target", None)
+        if configured_target is not None:
+            target = float(configured_target)
+        elif self.neg_sampler is not None and hasattr(self.neg_sampler, "hard_neg_ratio"):
             target = float(self.neg_sampler.hard_neg_ratio)
         start = min(max(float(self.cfg.hard_negative_ratio_start), 0.0), 1.0)
         target = min(max(float(target), 0.0), 1.0)
@@ -546,6 +716,8 @@ class Trainer:
         self,
         pos_edge_index: torch.Tensor,
         epoch: int,
+        allowed_dst=None,
+        strict: bool = False,
     ) -> Optional[torch.Tensor]:
         if (
             not self.cfg.online_negative_sampling
@@ -563,6 +735,12 @@ class Trainer:
                 pos_edge_index,
                 n_neg_per_pos=effective_neg_per_pos,
                 epoch=epoch,
+                allowed_dst=allowed_dst,
+                strict=bool(strict),
+                insufficient_negatives_policy="error" if strict else "skip",
+                with_replacement=bool(
+                    getattr(self.cfg, "online_negative_with_replacement", True)
+                ),
             )
         finally:
             self.neg_sampler.hard_neg_ratio = original_ratio
@@ -587,6 +765,8 @@ class Trainer:
         online_neg_ei = self._sample_online_negatives(
             pos_edge_index=pos_edge_index,
             epoch=epoch,
+            allowed_dst=getattr(train_data, "negative_allowed_dst", None),
+            strict=False,
         )
 
         if online_neg_ei is not None:
@@ -831,6 +1011,7 @@ class Trainer:
                     edge_label_index=edge_store.edge_label_index,
                     edge_label=edge_store.edge_label,
                     filtered_positive_pairs=filtered_positive_pairs,
+                    message_passing_edges=edge_index_dict_for_message_passing,
                 )
             )
             return metrics
@@ -980,13 +1161,7 @@ class Trainer:
         best_val_metrics: Dict[str, float] | None = None
         epochs_no_improve = 0
 
-        iterator = tqdm(
-            range(1, self.cfg.epochs + 1),
-            desc="Epoch",
-            unit="ep",
-            dynamic_ncols=True,
-            disable=not is_main_process(self.dist_state),
-        )
+        iterator = range(1, self.cfg.epochs + 1)
 
         for epoch in iterator:
             train_log = self._train_epoch(

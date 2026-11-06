@@ -1,8 +1,11 @@
 import argparse
 import gc
+import hashlib
 import importlib
+import json
 import os
 import random
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,6 +70,63 @@ class NNITrialReporter:
             for key, value in metrics.items():
                 payload[f"{prefix}_{self._metric_key(key)}"] = float(value)
         self.nni.report_final_result(payload)
+
+
+def _update_digest(digest, value) -> None:
+    if torch.is_tensor(value):
+        tensor = value.detach().cpu().contiguous()
+        digest.update(str(tensor.dtype).encode("utf-8"))
+        digest.update(str(tuple(tensor.shape)).encode("utf-8"))
+        digest.update(tensor.numpy().tobytes())
+        return
+    digest.update(repr(value).encode("utf-8"))
+
+
+def _data_digest(data, edge_type) -> str:
+    digest = hashlib.sha256()
+    _update_digest(digest, getattr(data, "split_mode", "edge_level"))
+    for key, edge_index in sorted(data.edge_index_dict.items(), key=lambda item: str(item[0])):
+        _update_digest(digest, key)
+        _update_digest(digest, edge_index)
+    if edge_type in getattr(data, "edge_types", []):
+        store = data[edge_type]
+        _update_digest(digest, getattr(store, "edge_label_index", None))
+        _update_digest(digest, getattr(store, "edge_label", None))
+    _update_digest(digest, getattr(data, "negative_allowed_dst", None))
+    return digest.hexdigest()[:16]
+
+
+def _sampler_digest(neg_sampler) -> str:
+    if neg_sampler is None:
+        return "none"
+    digest = hashlib.sha256()
+    for name in ("known_pos_csr", "relay_csr", "deg_probs"):
+        value = getattr(neg_sampler, name, None)
+        if value is None:
+            _update_digest(digest, None)
+            continue
+        if hasattr(value, "indptr"):
+            _update_digest(digest, value.indptr)
+            _update_digest(digest, value.indices)
+            _update_digest(digest, value.shape)
+        else:
+            _update_digest(digest, value)
+    _update_digest(digest, neg_sampler.stats())
+    return digest.hexdigest()[:16]
+
+
+def _git_revision() -> str:
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return "unknown"
+    return result.stdout.strip() or "unknown"
 
 
 def _metric_mean(summaries, key: str, section: str) -> float:
@@ -207,6 +267,17 @@ def get_args():
         help="disable online negative resampling and fall back to offline negatives",
     )
     parser.add_argument(
+        "--online_negative_with_replacement",
+        action="store_true",
+        default=True,
+        help="allow online negatives to repeat across positive rows for one source",
+    )
+    parser.add_argument(
+        "--disable_online_negative_with_replacement",
+        action="store_true",
+        help="require globally unique online negatives and allow variable counts",
+    )
+    parser.add_argument(
         "--use_contraindication_negatives",
         action="store_true",
         help="add train-time contraindication edges as explicit negatives",
@@ -230,6 +301,11 @@ def get_args():
         "--hard_negative_ratio_start",
         type=float,
         help="starting hard-negative ratio before curriculum ramps to sampler target",
+    )
+    parser.add_argument(
+        "--hard_negative_ratio_target",
+        type=float,
+        help="explicit target hard-negative ratio; set to 0 for a clean baseline",
     )
     parser.add_argument(
         "--min_learning_rate_ratio",
@@ -390,6 +466,8 @@ def get_args():
     args = parser.parse_args()
     if args.disable_online_negative_sampling:
         args.online_negative_sampling = False
+    if args.disable_online_negative_with_replacement:
+        args.online_negative_with_replacement = False
     if args.disable_contraindication_negatives:
         args.use_contraindication_negatives = False
     if args.disable_global_router:
@@ -494,6 +572,16 @@ def main():
                 neg_sampler = neg_sampler_mod.NegativeSampler.load(
                     str(neg_sampler_path)
                 )
+                train_store = train_data[edge_type_to_predict]
+                train_positive_mask = train_store.edge_label.detach().cpu() > 0.5
+                train_positive_ei = train_store.edge_label_index.detach().cpu()[:, train_positive_mask]
+                if hasattr(neg_sampler, "restrict_to_positive_edges"):
+                    neg_sampler.restrict_to_positive_edges(train_positive_ei)
+                    log0(
+                        dist_state,
+                        "Restricted loaded negative sampler to train positive edges "
+                        "before online sampling.",
+                    )
             else:
                 log0(
                     dist_state,
@@ -504,6 +592,8 @@ def main():
         split_mode = str(getattr(train_data, "split_mode", "edge_level")).lower()
         use_train_background_for_eval = split_mode != "disease_cold_start"
         train_data = train_data.to(dist_state.device)
+        valid_data = valid_data.to(dist_state.device)
+        test_data = test_data.to(dist_state.device)
 
         if use_train_background_for_eval:
             log0(
@@ -515,6 +605,20 @@ def main():
                 dist_state,
                 f"Keeping split-specific val/test message-passing graphs (split_mode={split_mode}).",
             )
+
+        effective_config_digest = hashlib.sha256(
+            json.dumps(vars(args), sort_keys=True, default=str).encode("utf-8")
+        ).hexdigest()[:16]
+        log0(dist_state, f"EffectiveConfigDigest: {effective_config_digest}")
+        log0(dist_state, f"GitRevision: {_git_revision()}")
+        log0(
+            dist_state,
+            "DataDigests: "
+            f"train={_data_digest(train_data, edge_type_to_predict)} "
+            f"val={_data_digest(valid_data, edge_type_to_predict)} "
+            f"test={_data_digest(test_data, edge_type_to_predict)}",
+        )
+        log0(dist_state, f"NegativeSamplerDigest: {_sampler_digest(neg_sampler)}")
 
         seed_list = list(getattr(args, "seed_list", []) or [args.seed])
         if dist_state.distributed and len(seed_list) > 1:
@@ -572,12 +676,20 @@ def main():
                 mechanism_dropout=args.mechanism_dropout,
                 train_neg_per_pos=int(args.train_neg_per_pos or 1),
                 online_negative_sampling=bool(args.online_negative_sampling),
+                online_negative_with_replacement=bool(
+                    args.online_negative_with_replacement
+                ),
                 use_contraindication_negatives=bool(
                     args.use_contraindication_negatives
                 ),
                 negative_curriculum_epochs=int(args.negative_curriculum_epochs or 0),
                 negative_start_factor=float(args.negative_start_factor or 1.0),
                 hard_negative_ratio_start=float(args.hard_negative_ratio_start or 0.0),
+                hard_negative_ratio_target=(
+                    None
+                    if args.hard_negative_ratio_target is None
+                    else float(args.hard_negative_ratio_target)
+                ),
                 min_learning_rate_ratio=float(args.min_learning_rate_ratio or 0.1),
             )
             run_reporter = (
@@ -617,6 +729,7 @@ def main():
                     test_data,
                     test_message_passing_edges,
                     filtered_positive_pairs=trainer._collect_known_positive_pairs(
+                        # (train_data, valid_data, test_data)
                         (train_data, valid_data)
                     ),
                 )

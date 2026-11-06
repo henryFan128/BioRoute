@@ -148,6 +148,7 @@ def full_candidate_filtered_ranking_metrics(
     known_positive_pairs: Optional[set[tuple[int, int]]] = None,
     group_axis: str = "dst",
     candidate_batch_size: int = 65536,
+    candidate_ids: Optional[Iterable[int]] = None,
 ) -> Dict[str, float]:
     axis = ranking_group_axis_to_int(group_axis)
     edge_index_cpu = edge_label_index.detach().cpu()
@@ -169,7 +170,20 @@ def full_candidate_filtered_ranking_metrics(
         return _empty_metrics()
 
     candidate_count = int(num_dst_nodes if axis == 0 else num_src_nodes)
-    all_candidates = np.arange(candidate_count, dtype=np.int64)
+    if candidate_ids is None:
+        all_candidates = np.arange(candidate_count, dtype=np.int64)
+    else:
+        if torch.is_tensor(candidate_ids):
+            candidate_values = candidate_ids.detach().cpu().numpy()
+        else:
+            candidate_values = list(candidate_ids)
+        all_candidates = np.asarray(candidate_values, dtype=np.int64).reshape(-1)
+        if all_candidates.size > 0:
+            if np.any(all_candidates < 0) or np.any(all_candidates >= candidate_count):
+                raise ValueError(
+                    "candidate_ids contains an id outside the candidate node range"
+                )
+            all_candidates = np.unique(all_candidates)
     sorted_labels = []
 
     for group_id, positives in positives_by_group.items():
@@ -199,7 +213,138 @@ def full_candidate_filtered_ranking_metrics(
             axis=axis,
             candidate_batch_size=candidate_batch_size,
         )
-        order = np.argsort(-scores)
+        order = np.argsort(-scores, kind="stable")
         sorted_labels.append(labels_for_candidates[order])
 
     return _metrics_from_sorted_labels(sorted_labels)
+
+
+def full_candidate_ranking_diagnostics(
+    edge_label_index: torch.Tensor,
+    edge_label: torch.Tensor,
+    num_src_nodes: int,
+    num_dst_nodes: int,
+    score_edges_fn: Callable[[torch.Tensor], np.ndarray],
+    known_positive_pairs: Optional[set[tuple[int, int]]] = None,
+    group_axis: str = "dst",
+    candidate_batch_size: int = 65536,
+    candidate_ids: Optional[Iterable[int]] = None,
+    top_k: int = 10,
+) -> Dict[str, object]:
+    """Return candidate concentration and per-candidate rank diagnostics."""
+    axis = ranking_group_axis_to_int(group_axis)
+    edge_index_cpu = edge_label_index.detach().cpu()
+    labels = edge_label.detach().cpu() > 0.5
+    known_positive_pairs = known_positive_pairs or set()
+
+    positives_by_group: dict[int, set[int]] = defaultdict(set)
+    for edge_idx, is_positive in enumerate(labels.tolist()):
+        if not bool(is_positive):
+            continue
+        src_idx = int(edge_index_cpu[0, edge_idx].item())
+        dst_idx = int(edge_index_cpu[1, edge_idx].item())
+        if axis == 0:
+            positives_by_group[src_idx].add(dst_idx)
+        else:
+            positives_by_group[dst_idx].add(src_idx)
+
+    candidate_count = int(num_dst_nodes if axis == 0 else num_src_nodes)
+    if candidate_ids is None:
+        all_candidates = np.arange(candidate_count, dtype=np.int64)
+    elif torch.is_tensor(candidate_ids):
+        all_candidates = candidate_ids.detach().cpu().numpy().astype(np.int64)
+    else:
+        all_candidates = np.asarray(list(candidate_ids), dtype=np.int64)
+    all_candidates = np.unique(all_candidates.reshape(-1))
+    if all_candidates.size > 0 and (
+        np.any(all_candidates < 0) or np.any(all_candidates >= candidate_count)
+    ):
+        raise ValueError("candidate_ids contains an invalid node id")
+
+    top_k = max(1, int(top_k))
+    top_candidates: set[int] = set()
+    top1_candidates: set[int] = set()
+    top_slot_frequency: dict[int, int] = defaultdict(int)
+    total_top_slots = 0
+    per_candidate: dict[int, dict[str, float]] = defaultdict(
+        lambda: {
+            "appearances": 0.0,
+            "rank_sum": 0.0,
+            "top1_count": 0.0,
+            "topk_count": 0.0,
+        }
+    )
+    group_count = 0
+
+    for group_id, positives in positives_by_group.items():
+        kept_candidates = []
+        for candidate in all_candidates.tolist():
+            pair = (group_id, candidate) if axis == 0 else (candidate, group_id)
+            if pair in known_positive_pairs and candidate not in positives:
+                continue
+            kept_candidates.append(candidate)
+        candidates = np.asarray(kept_candidates, dtype=np.int64)
+        if candidates.size == 0:
+            continue
+        labels_for_candidates = np.asarray(
+            [1.0 if int(candidate) in positives else 0.0 for candidate in candidates],
+            dtype=np.float64,
+        )
+        if labels_for_candidates.sum() <= 0:
+            continue
+        scores = _score_candidate_edges(
+            score_edges_fn=score_edges_fn,
+            group_id=group_id,
+            candidates=candidates,
+            axis=axis,
+            candidate_batch_size=candidate_batch_size,
+        )
+        order = np.argsort(-scores, kind="stable")
+        ranked_candidates = candidates[order]
+        group_count += 1
+        group_top_k = min(top_k, int(ranked_candidates.size))
+        total_top_slots += group_top_k
+        for candidate in ranked_candidates[:group_top_k].tolist():
+            candidate = int(candidate)
+            top_candidates.add(candidate)
+            top_slot_frequency[candidate] += 1
+        if ranked_candidates.size > 0:
+            top1_candidates.add(int(ranked_candidates[0]))
+        for rank, candidate in enumerate(ranked_candidates.tolist(), start=1):
+            payload = per_candidate[int(candidate)]
+            payload["appearances"] += 1.0
+            payload["rank_sum"] += float(rank)
+            if rank == 1:
+                payload["top1_count"] += 1.0
+            if rank <= top_k:
+                payload["topk_count"] += 1.0
+
+    serialised_per_candidate = {
+        int(candidate): {
+            "appearances": float(payload["appearances"]),
+            "mean_rank": float(
+                payload["rank_sum"] / max(payload["appearances"], 1.0)
+            ),
+            "top1_count": float(payload["top1_count"]),
+            "topk_count": float(payload["topk_count"]),
+        }
+        for candidate, payload in per_candidate.items()
+    }
+    return {
+        "group_count": int(group_count),
+        "candidate_count": int(all_candidates.size),
+        "top_k": int(top_k),
+        "top_k_slot_concentration": float(
+            sum(
+                count
+                for _, count in sorted(
+                    top_slot_frequency.items(),
+                    key=lambda item: (-item[1], item[0]),
+                )[:top_k]
+            )
+            / max(float(total_top_slots), 1.0)
+        ),
+        "top_k_unique_candidates": int(len(top_candidates)),
+        "top1_unique_candidates": int(len(top1_candidates)),
+        "per_candidate": serialised_per_candidate,
+    }

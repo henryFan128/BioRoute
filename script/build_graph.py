@@ -1,15 +1,3 @@
-"""
-Usage:
-  python scripts/build_graph.py \
-      --entities_path  data/idkg/entities.pkl \
-      --edges_path     data/idkg/edges.pkl \
-      --features_dir   data/features \
-      --edge_mapping   config/edge_mapping.yaml \
-      --output_graph   data/raw/full_graph_data.pt \
-      --split_dir      data/split \
-      --mapping_dir    data/mapping
-"""
-
 import argparse
 import json
 import logging
@@ -23,8 +11,12 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 import numpy as np
 import torch
 import yaml
-from negative_sampler import NegativeSampler
 from torch_geometric.data import HeteroData
+
+try:
+    from negative_sampler import NegativeSampler
+except ImportError:
+    from script.negative_sampler import NegativeSampler
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -50,7 +42,7 @@ ENTITY_TYPE_MAP = {
 
 
 # =========================================================================
-# Stage 4-A: Node ID → local index mapping
+# Node ID → local index mapping
 # =========================================================================
 
 
@@ -126,7 +118,7 @@ def build_entity_lookup(
 
 
 # =========================================================================
-# Stage 4-B: Load feature matrices and attach to HeteroData
+# Load feature matrices and attach to HeteroData
 # =========================================================================
 
 
@@ -181,7 +173,7 @@ def load_feature_matrices(
 
 
 # =========================================================================
-# Stage 4-C: Build edge_index tensors
+# Build edge_index tensors
 # =========================================================================
 
 
@@ -285,7 +277,7 @@ def save_query_groups(
 
 
 # =========================================================================
-# Stage 5-A: Supervision edge separation
+# Supervision edge separation
 # =========================================================================
 
 
@@ -324,7 +316,7 @@ def separate_supervision_edges(
 
 
 # =========================================================================
-# Stage 5-B: Split supervision edges
+# Split supervision edges
 # =========================================================================
 
 
@@ -691,7 +683,7 @@ def filter_background_edges_by_node_split(
 
 
 # =========================================================================
-# Stage 4-D / 5-D: Assemble HeteroData objects
+# Assemble HeteroData objects
 # =========================================================================
 
 
@@ -744,6 +736,8 @@ def sample_query_aligned_negatives(
     degree_match_quantiles: int = 5,
     strict: bool = False,
     with_replacement: bool = False,
+    allowed_candidates: Optional[torch.Tensor] = None,
+    insufficient_negatives_policy: str = "error",
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Sample negatives by fixing each query node and corrupting the candidate node.
 
@@ -758,6 +752,14 @@ def sample_query_aligned_negatives(
     n_neg_per_pos = int(n_neg_per_pos)
     if n_neg_per_pos <= 0:
         return torch.zeros((2, 0), dtype=torch.long), torch.zeros(0)
+
+    policy = str(insufficient_negatives_policy).lower()
+    if policy not in {"error", "skip", "replace"}:
+        raise ValueError(
+            "insufficient_negatives_policy must be one of: error, skip, replace"
+        )
+    if strict:
+        policy = "error"
 
     candidate_axis = 1 - int(query_axis)
     num_candidates = int(num_src if candidate_axis == 0 else num_dst)
@@ -775,7 +777,18 @@ def sample_query_aligned_negatives(
         all_pos[candidate_axis].long(),
         minlength=num_candidates,
     ).cpu().numpy()
-    candidate_ids = np.arange(num_candidates, dtype=np.int64)
+    if allowed_candidates is None:
+        candidate_ids = np.arange(num_candidates, dtype=np.int64)
+    else:
+        candidate_ids = allowed_candidates.detach().cpu().numpy()
+        candidate_ids = np.asarray(candidate_ids, dtype=np.int64).reshape(-1)
+        if candidate_ids.size == 0:
+            if strict:
+                raise ValueError("No allowed query-aligned candidate nodes")
+            return torch.zeros((2, 0), dtype=torch.long), torch.zeros(0)
+        if np.any(candidate_ids < 0) or np.any(candidate_ids >= num_candidates):
+            raise ValueError("allowed_candidates contains an invalid node id")
+        candidate_ids = np.unique(candidate_ids)
 
     candidate_bucket = np.zeros(num_candidates, dtype=np.int64)
     bucket_to_candidates: Dict[int, np.ndarray] = {0: candidate_ids}
@@ -832,14 +845,15 @@ def sample_query_aligned_negatives(
             available = _available(query_id, bucket if degree_matched else 0, include_used=True)
             if available.size < n_neg_per_pos and degree_matched:
                 available = _available(query_id, 0, include_used=True)
-            replace = True
+            if not replace and policy == "replace":
+                replace = True
         if available.size == 0:
-            if strict:
+            if policy == "error":
                 raise ValueError(
                     f"No query-aligned negative candidates for query_id={query_id}"
                 )
             continue
-        if strict and not replace and available.size < n_neg_per_pos:
+        if policy == "error" and not replace and available.size < n_neg_per_pos:
             raise ValueError(
                 "insufficient query-aligned negatives: "
                 f"query_id={query_id}, needed={n_neg_per_pos}, available={available.size}"
@@ -1220,9 +1234,9 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Stage 4-A: Node index
+    # Node index
     # ------------------------------------------------------------------
-    logger.info("=== Stage 4-A: Building node index ===")
+    logger.info("=== Stage A: Building node index ===")
     node_index = build_node_index(entities)
 
     # Serialise node_index (convert int keys → str for JSON)
@@ -1241,9 +1255,9 @@ def main() -> None:
     logger.info(f"Entity lookup saved → {entity_lookup_path}")
 
     # ------------------------------------------------------------------
-    # Stage 4-B: Feature matrices
+    # Feature matrices
     # ------------------------------------------------------------------
-    logger.info("=== Stage 4-B: Loading feature matrices ===")
+    logger.info("=== Stage B: Loading feature matrices ===")
     x_dict = load_feature_matrices(args.features_dir, node_index)
     # Shapes:
     #   chemical: [N_chem, 2816]   protein: [N_prot, 1280]
@@ -1251,9 +1265,9 @@ def main() -> None:
     #   pathogen: [N_path,  768]
 
     # ------------------------------------------------------------------
-    # Stage 4-C: Edge indices
+    # Edge indices
     # ------------------------------------------------------------------
-    logger.info("=== Stage 4-C: Building edge index tensors ===")
+    logger.info("=== Stage C: Building edge index tensors ===")
     edge_index_dict = build_edge_indices(all_edges, node_index)
     full_edge_index_dict = add_logical_reverse_edges(edge_index_dict, reverse_specs)
 
@@ -1267,9 +1281,9 @@ def main() -> None:
     logger.info(f"  Edge types:  {full_graph.edge_types}")
 
     # ------------------------------------------------------------------
-    # Stage 5-A: Separate supervision edges from background
+    # Separate supervision edges from background
     # ------------------------------------------------------------------
-    logger.info("=== Stage 5-A: Separating supervision edges ===")
+    logger.info("=== Stage D: Separating supervision edges ===")
     reverse_supervision_triples: Set[EdgeTriple] = {
         reverse_relation_map[triple]
         for triple in supervision_triples
@@ -1282,10 +1296,10 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Stage 5-B: Split supervision edges
+    # Split supervision edges
     # ------------------------------------------------------------------
     logger.info(
-        "=== Stage 5-B: Splitting supervision edges "
+        "=== Stage E: Splitting supervision edges "
         f"(mode={split_mode}, ratio={split_ratio}) ==="
     )
     train_sup, val_sup, test_sup, split_meta = split_supervision_edges(
@@ -1304,9 +1318,9 @@ def main() -> None:
     test_query_sup = derive_reverse_split_edges(test_sup, reverse_relation_map)
 
     # ------------------------------------------------------------------
-    # Stage 5-C: Build NegativeSampler (vectorized, per-epoch online)
+    # Build NegativeSampler (vectorized, per-epoch online)
     # ------------------------------------------------------------------
-    logger.info("=== Stage 5-C: Building NegativeSampler ===")
+    logger.info("=== Stage F: Building NegativeSampler ===")
     logger.info(
         "Negative sampling config: "
         f"hard_neg_ratio={hard_neg_ratio}, "
@@ -1385,7 +1399,10 @@ def main() -> None:
         if prot_dis_triples
         else None
     )
-    primary_cd_ei = supervision_edges.get(primary_forward_triple)
+    primary_cd_ei = train_sup.get(primary_forward_triple)
+    train_primary_sup_ei = train_sup.get(
+        primary_forward_triple, torch.zeros((2, 0), dtype=torch.long)
+    )
 
     relay_path_eis = None
     relay_path_shapes = None
@@ -1439,7 +1456,7 @@ def main() -> None:
         )
 
     sampler = NegativeSampler.build_from_edges(
-        sup_ei=all_sup_ei,
+        sup_ei=train_primary_sup_ei,
         num_src=num_chem,
         num_dst=num_dis,
         cp_ei=cp_ei,
@@ -1455,6 +1472,8 @@ def main() -> None:
         hard_neg_quota_strict=hard_neg_quota_strict,
         degree_matched_negatives=degree_matched_negatives,
         degree_match_quantiles=degree_match_quantiles,
+        known_pos_ei=train_primary_sup_ei,
+        degree_pos_ei=train_primary_sup_ei,
         base_seed=args.seed,
     )
     sampler_path = os.path.join(args.split_dir, "neg_sampler.pkl")
@@ -1464,16 +1483,30 @@ def main() -> None:
         logger.info(f"  {k}: {v}")
 
     # ------------------------------------------------------------------
-    # Stage 5-D: Assemble and save split HeteroData objects
+    # Assemble and save split HeteroData objects
     # - transductive modes: val/test message-passing background == train background
     # - disease_cold_start: split-specific message-passing backgrounds
     # ------------------------------------------------------------------
-    logger.info("=== Stage 5-D: Assembling and saving split datasets ===")
+    logger.info("=== Stage G: Assembling and saving split datasets ===")
     leakage_cold_node_type: Optional[str] = None
     primary_triple = primary_forward_triple
     all_primary_sup_ei = supervision_edges.get(
         primary_triple, torch.zeros((2, 0), dtype=torch.long)
     )
+    train_primary_sup_ei = train_sup.get(
+        primary_triple, torch.zeros((2, 0), dtype=torch.long)
+    )
+    val_primary_sup_ei = val_sup.get(
+        primary_triple, torch.zeros((2, 0), dtype=torch.long)
+    )
+    test_primary_sup_ei = test_sup.get(
+        primary_triple, torch.zeros((2, 0), dtype=torch.long)
+    )
+    split_exclusion_ei = {
+        "train": train_primary_sup_ei,
+        "val": torch.cat([train_primary_sup_ei, val_primary_sup_ei], dim=1),
+        "test": torch.cat([train_primary_sup_ei, test_primary_sup_ei], dim=1),
+    }
     negative_allowed_dst_by_split: Dict[str, Optional[torch.Tensor]] = {
         "train": None,
         "val": None,
@@ -1553,6 +1586,10 @@ def main() -> None:
         if allowed_dst is not None:
             data.negative_allowed_dst = allowed_dst.clone()
             data.negative_allowed_dst_node_type = primary_triple[2]
+            data.ranking_candidate_ids = allowed_dst.clone()
+            data.ranking_candidate_node_type = primary_triple[2]
+        data.negative_sampling_strict = bool(strict_negative_ratio_contract)
+        data.negative_sampling_with_replacement = bool(with_replacement)
         if primary_triple in data.edge_types:
             data[primary_triple].known_positive_edge_index = (
                 all_primary_sup_ei.clone()
@@ -1564,7 +1601,7 @@ def main() -> None:
         if query_aligned_negatives:
             neg_ei, neg_lbl = sample_query_aligned_negatives(
                 train_pos_ei,
-                all_primary_sup_ei,
+                split_exclusion_ei["train"],
                 num_src=num_chem,
                 num_dst=num_dis,
                 query_axis=query_axis,
@@ -1574,6 +1611,12 @@ def main() -> None:
                 degree_match_quantiles=degree_match_quantiles,
                 strict=strict_negative_ratio_contract,
                 with_replacement=with_replacement,
+                insufficient_negatives_policy="error",
+                allowed_candidates=(
+                    negative_allowed_dst_by_split["train"]
+                    if (1 - query_axis) == 1
+                    else None
+                ),
             )
         else:
             neg_ei, neg_lbl = sampler.sample_epoch(
@@ -1584,6 +1627,7 @@ def main() -> None:
                 insufficient_negatives_policy="error",
                 with_replacement=with_replacement,
                 allowed_dst=negative_allowed_dst_by_split["train"],
+                exclude_pos_ei=split_exclusion_ei["train"],
             )
         assert_exact_k("train", train_pos_ei, neg_ei, n_neg_per_pos)
         # Combine pos + neg
@@ -1620,7 +1664,7 @@ def main() -> None:
         if query_aligned_negatives:
             val_neg_ei, val_neg_lbl = sample_query_aligned_negatives(
                 val_pos_ei,
-                all_primary_sup_ei,
+                split_exclusion_ei["val"],
                 num_src=num_chem,
                 num_dst=num_dis,
                 query_axis=query_axis,
@@ -1630,6 +1674,12 @@ def main() -> None:
                 degree_match_quantiles=degree_match_quantiles,
                 strict=strict_negative_ratio_contract,
                 with_replacement=with_replacement,
+                insufficient_negatives_policy="error",
+                allowed_candidates=(
+                    negative_allowed_dst_by_split["val"]
+                    if (1 - query_axis) == 1
+                    else None
+                ),
             )
         else:
             val_neg_ei, val_neg_lbl = sampler.sample_epoch(
@@ -1640,6 +1690,7 @@ def main() -> None:
                 insufficient_negatives_policy="error",
                 with_replacement=with_replacement,
                 allowed_dst=negative_allowed_dst_by_split["val"],
+                exclude_pos_ei=split_exclusion_ei["val"],
             )
         assert_exact_k("val", val_pos_ei, val_neg_ei, val_test_neg_per_pos)
         val_pos_lbl = torch.ones(val_pos_ei.shape[1])
@@ -1673,7 +1724,7 @@ def main() -> None:
         if query_aligned_negatives:
             test_neg_ei, test_neg_lbl = sample_query_aligned_negatives(
                 test_pos_ei,
-                all_primary_sup_ei,
+                split_exclusion_ei["test"],
                 num_src=num_chem,
                 num_dst=num_dis,
                 query_axis=query_axis,
@@ -1683,6 +1734,12 @@ def main() -> None:
                 degree_match_quantiles=degree_match_quantiles,
                 strict=strict_negative_ratio_contract,
                 with_replacement=with_replacement,
+                insufficient_negatives_policy="error",
+                allowed_candidates=(
+                    negative_allowed_dst_by_split["test"]
+                    if (1 - query_axis) == 1
+                    else None
+                ),
             )
         else:
             test_neg_ei, test_neg_lbl = sampler.sample_epoch(
@@ -1693,6 +1750,7 @@ def main() -> None:
                 insufficient_negatives_policy="error",
                 with_replacement=with_replacement,
                 allowed_dst=negative_allowed_dst_by_split["test"],
+                exclude_pos_ei=split_exclusion_ei["test"],
             )
         assert_exact_k("test", test_pos_ei, test_neg_ei, val_test_neg_per_pos)
         test_pos_lbl = torch.ones(test_pos_ei.shape[1])
@@ -1720,9 +1778,9 @@ def main() -> None:
     )
 
     # ------------------------------------------------------------------
-    # Stage 5-E: Export query-centric supervision metadata
+    # Export query-centric supervision metadata
     # ------------------------------------------------------------------
-    logger.info("=== Stage 5-E: Exporting query-centric supervision ===")
+    logger.info("=== Stage H: Exporting query-centric supervision ===")
     num_query_nodes = x_dict[primary_query_triple[0]].shape[0]
     num_candidate_nodes = x_dict[primary_query_triple[2]].shape[0]
     query_metadata = {

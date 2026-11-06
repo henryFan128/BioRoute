@@ -196,7 +196,8 @@ class SRRLayer(nn.Module):
                 rel_vec = self._relation_vector(triple, relation_state, src_feat)
                 rel_feat = self.inter_rel_proj(rel_vec).unsqueeze(0).expand(src_feat.shape[0], -1)
                 q = self._split_heads(self.inter_q_proj(dst_feat))
-                k = self._split_heads(self.inter_k_proj(src_feat * rel_feat))
+                # k = self._split_heads(self.inter_k_proj(src_feat * rel_feat))
+                k = self._split_heads(self.inter_k_proj(src_feat * torch.sigmoid(rel_feat)))
                 v = self._split_heads(self.inter_v_proj(src_feat))
 
             scores = (q * k).sum(dim=-1) / math.sqrt(self.head_dim)
